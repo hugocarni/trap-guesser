@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Layout } from './components/Layout';
 import { Song, GameStatus, GameState, Player } from './types';
 import { fetchTopTrapReggaeton } from './services/musicService';
-import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Cell } from 'recharts';
+import { BarChart, Bar, ResponsiveContainer, Cell } from 'recharts';
 
 declare const Peer: any;
 
@@ -36,7 +36,6 @@ const App: React.FC = () => {
   const peerRef = useRef<any>(null);
   const connectionsRef = useRef<any[]>([]);
 
-  // Initialize music pool
   useEffect(() => {
     const init = async () => {
       const data = await fetchTopTrapReggaeton();
@@ -46,12 +45,10 @@ const App: React.FC = () => {
     init();
   }, []);
 
-  // Sync volume
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = volume;
   }, [volume]);
 
-  // PeerJS Messaging Helpers
   const broadcast = (data: any) => {
     connectionsRef.current.forEach(conn => {
       if (conn.open) conn.send(data);
@@ -68,15 +65,11 @@ const App: React.FC = () => {
     setStartTime(null);
   }, []);
 
-  const playSnippet = useCallback((songToPlay?: Song, durationOverride?: number) => {
-    const targetSong = songToPlay || gameState.currentSong;
-    // Use override or fallback to current state. Using local variable ensures we don't wait for async state update.
-    const duration = durationOverride !== undefined ? durationOverride : gameState.difficultySeconds;
-    
-    if (!audioRef.current || !targetSong) return;
+  const playSnippet = useCallback((songToPlay: Song, duration: number) => {
+    if (!audioRef.current || !songToPlay) return;
     
     stopAudio();
-    audioRef.current.src = targetSong.previewUrl;
+    audioRef.current.src = songToPlay.previewUrl;
     audioRef.current.volume = volume;
     
     const playPromise = audioRef.current.play();
@@ -84,6 +77,7 @@ const App: React.FC = () => {
       playPromise
         .then(() => {
           setIsPlaying(true);
+          // Precise start time for calculating individual response speed
           setStartTime(Date.now());
           
           if (timerRef.current) clearTimeout(timerRef.current);
@@ -92,11 +86,10 @@ const App: React.FC = () => {
             setIsPlaying(false);
           }, duration * 1000);
         })
-        .catch(e => console.log("Playback blocked or interrupted:", e));
+        .catch(e => console.error("Playback error:", e));
     }
-  }, [gameState.currentSong, gameState.difficultySeconds, volume, stopAudio]);
+  }, [volume, stopAudio]);
 
-  // Multiplayer Message Handler
   const handlePeerData = useCallback((data: any) => {
     if (data.type === 'GAME_STATE_UPDATE') {
       setGameState(prev => ({ ...prev, ...data.payload }));
@@ -107,8 +100,8 @@ const App: React.FC = () => {
         status: GameStatus.PLAYING 
       }));
     } else if (data.type === 'PLAY_AUDIO') {
-      // Audio trigger from host
-      setTimeout(() => playSnippet(data.song, data.duration), 100);
+      // Clients receive song and duration from host to sync playback
+      setTimeout(() => playSnippet(data.song, data.duration), 50);
     } else if (data.type === 'REVEAL') {
       setGameState(prev => ({ ...prev, status: GameStatus.REVEALING, players: data.players }));
       stopAudio();
@@ -116,7 +109,7 @@ const App: React.FC = () => {
       const newPlayer: Player = data.player;
       setGameState(prev => {
         const updatedPlayers = [...prev.players.filter(p => p.id !== newPlayer.id), newPlayer];
-        broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: updatedPlayers, status: prev.status } });
+        broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: updatedPlayers } });
         return { ...prev, players: updatedPlayers };
       });
     } else if (data.type === 'GUESS_SUBMITTED') {
@@ -140,7 +133,6 @@ const App: React.FC = () => {
     }
   }, [playSnippet, stopAudio]);
 
-  // Create Room
   const createRoom = () => {
     if (!gameState.playerName) return;
     const code = Math.random().toString(36).substring(2, 6).toUpperCase();
@@ -172,14 +164,12 @@ const App: React.FC = () => {
       conn.on('data', handlePeerData);
     });
 
-    peer.on('error', (err: any) => {
-      console.error("Peer Error:", err);
-      alert("Error al crear la sala. Quizás el código ya está en uso.");
+    peer.on('error', () => {
+      alert("Error al crear sala. Intenta otro código.");
       window.location.reload();
     });
   };
 
-  // Join Room
   const joinRoom = () => {
     if (!gameState.playerName || !roomInput) return;
     const peer = new Peer();
@@ -198,10 +188,7 @@ const App: React.FC = () => {
       conn.on('data', handlePeerData);
     });
 
-    peer.on('error', (err: any) => {
-       console.error("Join Error:", err);
-       alert("No se pudo conectar a la sala. Verifica el código.");
-    });
+    peer.on('error', () => alert("No se encontró la sala."));
   };
 
   const startNewRound = useCallback((isChallenge: boolean = false) => {
@@ -235,13 +222,11 @@ const App: React.FC = () => {
       };
 
       if (prev.isMultiplayer) {
-        // Send updated round data to everyone
         broadcast({ type: 'START_ROUND', payload: nextRoundData });
-        // After state should have updated, trigger audio for host and clients
         setTimeout(() => {
           broadcast({ type: 'PLAY_AUDIO', song: currentSong, duration: nextDifficulty });
-          playSnippet(currentSong, nextDifficulty); // Host plays locally too
-        }, 600);
+          playSnippet(currentSong, nextDifficulty); // Host plays locally
+        }, 800);
       } else {
         setTimeout(() => playSnippet(currentSong, nextDifficulty), 100);
       }
@@ -252,29 +237,28 @@ const App: React.FC = () => {
 
   const handleGuess = (songId: string) => {
     if (gameState.status !== GameStatus.PLAYING) return;
-    const endTime = Date.now();
+    const now = Date.now();
     const isCorrect = songId === gameState.currentSong?.id;
     
     let points = 0;
     if (isCorrect && startTime) {
-      const timeElapsed = (endTime - startTime) / 1000;
+      const timeElapsed = (now - startTime) / 1000;
       const timeLeft = Math.max(0, gameState.difficultySeconds - timeElapsed);
-      const timeBonus = Math.round((timeLeft / gameState.difficultySeconds) * 50);
+      // Individual bonus based on local response speed
+      const speedMultiplier = (timeLeft / gameState.difficultySeconds);
       const basePoints = 50;
+      const timeBonus = Math.round(speedMultiplier * 50);
       points = basePoints + timeBonus;
       
       if (gameState.isChallengeMode) {
-        const multiplier = 1 + (gameState.currentRound - 1) * 0.2;
-        points = Math.round(points * multiplier);
+        const challengeMultiplier = 1 + (gameState.currentRound - 1) * 0.1;
+        points = Math.round(points * challengeMultiplier);
       }
     }
 
     if (gameState.isMultiplayer) {
       const myId = peerRef.current.id;
-      // Host and Clients both broadcast their guess
       broadcast({ type: 'GUESS_SUBMITTED', playerId: myId, isCorrect, points });
-      
-      // Update local state for immediate feedback
       setGameState(prev => ({
         ...prev,
         players: prev.players.map(p => p.id === myId ? { ...p, hasAnswered: true, lastGuessCorrect: isCorrect, score: p.score + points } : p),
@@ -295,16 +279,11 @@ const App: React.FC = () => {
   const startPractice = () => {
     if (!gameState.playerName) return;
     const soloPlayer: Player = { id: 'local-player', name: gameState.playerName, score: 0, isHost: true };
-    setGameState(prev => ({ 
-      ...prev, 
-      status: GameStatus.START, 
-      isMultiplayer: false,
-      players: [soloPlayer] 
-    }));
+    setGameState(prev => ({ ...prev, status: GameStatus.START, isMultiplayer: false, players: [soloPlayer] }));
   };
 
   const handleReset = () => {
-    window.location.reload();
+    window.location.href = window.location.href; // Strong reload
   };
 
   if (loading) {
@@ -385,22 +364,19 @@ const App: React.FC = () => {
           </div>
           
           <div className="bg-black/30 rounded-2xl p-6 mb-8 text-left space-y-3 max-h-64 overflow-y-auto border border-zinc-800/50">
-            <p className="text-zinc-600 font-black text-[10px] uppercase tracking-widest border-b border-zinc-800 pb-2">Jugadores en espera ({gameState.players.length})</p>
-            {gameState.players.length === 0 && (
-              <p className="text-zinc-500 font-bold uppercase tracking-widest text-xs py-4 text-center">Conectando...</p>
-            )}
+            <p className="text-zinc-600 font-black text-[10px] uppercase tracking-widest border-b border-zinc-800 pb-2">Jugadores ({gameState.players.length})</p>
             {gameState.players.map(p => (
               <div key={p.id} className="flex justify-between items-center group">
                 <span className="font-black text-white uppercase tracking-tight text-sm flex items-center gap-2">
                   <div className={`w-2 h-2 rounded-full ${p.isHost ? 'bg-yellow-400' : 'bg-green-500'} animate-pulse`}></div>
                   {p.name} {p.isHost && '👑'}
                 </span>
-                <span className="text-zinc-500 text-[10px] uppercase font-black">Conectado</span>
+                <span className="text-zinc-500 text-[10px] uppercase font-black">Ready</span>
               </div>
             ))}
           </div>
 
-          {(gameState.players.length > 0 && gameState.players.find(p => p.isHost && (p.id === peerRef.current?.id || p.id === 'local-player'))) ? (
+          {(gameState.players.some(p => p.isHost && (p.id === peerRef.current?.id || p.id === 'local-player'))) ? (
             <button 
               onClick={() => setGameState(p => ({ ...p, status: GameStatus.START }))}
               className="w-full bg-yellow-400 text-black py-5 rounded-2xl font-black uppercase tracking-widest hover:bg-white transition-all shadow-glow transform active:scale-95"
@@ -417,11 +393,10 @@ const App: React.FC = () => {
 
       {gameState.status === GameStatus.START && (
         <div className="bg-zinc-900 p-6 md:p-10 rounded-3xl border border-zinc-800 text-center shadow-2xl relative overflow-hidden animate-in fade-in duration-500">
-          <h1 className="text-4xl md:text-5xl font-black mb-8 neon-text tracking-tighter uppercase italic">Ajustes del Juego</h1>
-          
-          <div className="space-y-8 relative z-10">
+          <h1 className="text-4xl md:text-5xl font-black mb-8 neon-text tracking-tighter uppercase italic">Ajustes</h1>
+          <div className="space-y-8">
             <div>
-              <label className="block text-zinc-500 text-[10px] md:text-xs font-black mb-4 uppercase tracking-widest">Segundos de audio</label>
+              <label className="block text-zinc-500 text-[10px] font-black mb-4 uppercase tracking-widest">Segundos de audio</label>
               <div className="flex justify-center gap-2 md:gap-4">
                 {[1, 3, 5, 10].map(s => (
                   <button
@@ -436,9 +411,8 @@ const App: React.FC = () => {
                 ))}
               </div>
             </div>
-
             <div>
-              <label className="block text-zinc-500 text-[10px] md:text-xs font-black mb-4 uppercase tracking-widest">Número de Rondas</label>
+              <label className="block text-zinc-500 text-[10px] font-black mb-4 uppercase tracking-widest">Rondas</label>
               <div className="flex justify-center gap-2 md:gap-4">
                 {[5, 10, 20, 50].map(r => (
                   <button
@@ -454,20 +428,9 @@ const App: React.FC = () => {
               </div>
             </div>
           </div>
-
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-12">
-            <button
-              onClick={() => startNewRound(false)}
-              className="bg-zinc-100 text-black py-5 rounded-2xl font-black text-lg md:text-xl uppercase tracking-widest hover:bg-yellow-400 transition-all transform active:scale-95 shadow-xl"
-            >
-              Modo Normal
-            </button>
-            <button
-              onClick={() => startNewRound(true)}
-              className="bg-orange-600 text-white py-5 rounded-2xl font-black text-lg md:text-xl uppercase tracking-widest hover:bg-orange-500 transition-all transform active:scale-95 border-b-4 border-orange-800"
-            >
-              Modo Desafío 🔥
-            </button>
+            <button onClick={() => startNewRound(false)} className="bg-zinc-100 text-black py-5 rounded-2xl font-black text-lg uppercase tracking-widest hover:bg-yellow-400 transition-all">Modo Normal</button>
+            <button onClick={() => startNewRound(true)} className="bg-orange-600 text-white py-5 rounded-2xl font-black text-lg uppercase tracking-widest border-b-4 border-orange-800">Modo Desafío 🔥</button>
           </div>
         </div>
       )}
@@ -478,7 +441,7 @@ const App: React.FC = () => {
             <div className="space-y-1">
               <div className="text-zinc-500 font-black uppercase text-[10px] tracking-widest">Ronda {gameState.currentRound} de {gameState.totalRounds}</div>
               <div className="text-white font-black text-xl flex items-center gap-2">
-                <span className="text-yellow-400 text-sm">SCORE</span>
+                <span className="text-yellow-400 text-sm font-bungee">SCORE</span>
                 {gameState.isMultiplayer 
                   ? (gameState.players.find(p => p.id === (peerRef.current?.id))?.score || 0)
                   : (gameState.players[0]?.score || 0)}
@@ -486,13 +449,12 @@ const App: React.FC = () => {
             </div>
             {gameState.isMultiplayer && (
                <div className="text-right">
-                  <div className="text-zinc-500 font-black uppercase text-[10px] tracking-widest mb-2">Sala: {gameState.roomCode}</div>
+                  <div className="text-zinc-500 font-black uppercase text-[10px] tracking-widest mb-2">SALA: {gameState.roomCode}</div>
                   <div className="flex -space-x-2 justify-end">
                     {gameState.players.map(p => (
                       <div 
                         key={p.id} 
-                        title={p.name}
-                        className={`w-9 h-9 rounded-full border-2 border-zinc-900 flex items-center justify-center text-xs font-black uppercase transition-colors ${p.hasAnswered ? 'bg-green-500 shadow-glow' : 'bg-zinc-800 text-zinc-500'}`}
+                        className={`w-9 h-9 rounded-full border-2 border-zinc-900 flex items-center justify-center text-xs font-black uppercase ${p.hasAnswered ? 'bg-green-500 shadow-glow' : 'bg-zinc-800 text-zinc-500'}`}
                       >
                         {p.name.charAt(0)}
                       </div>
@@ -505,7 +467,7 @@ const App: React.FC = () => {
           <div className="bg-zinc-900 rounded-[2.5rem] p-6 md:p-8 border border-zinc-800 shadow-2xl text-center relative overflow-hidden">
              <div className="relative w-44 h-44 md:w-56 md:h-56 mx-auto mb-8">
                 {gameState.status === GameStatus.REVEALING ? (
-                  <img src={gameState.currentSong?.artworkUrl} className="w-full h-full object-cover rounded-[2rem] ring-4 ring-yellow-400/20 shadow-2xl animate-in zoom-in duration-500" alt="Song" />
+                  <img src={gameState.currentSong?.artworkUrl} className="w-full h-full object-cover rounded-[2rem] ring-4 ring-yellow-400/20 shadow-2xl animate-in zoom-in duration-500" alt="Artwork" />
                 ) : (
                   <div className={`w-full h-full bg-zinc-950 rounded-[2rem] flex items-center justify-center border-2 border-zinc-800 relative overflow-hidden`}>
                      <div className={`w-28 h-28 md:w-36 md:h-36 rounded-full border-[10px] border-zinc-900 bg-zinc-800 flex items-center justify-center ${isPlaying ? 'animate-spin-slow' : ''}`}>
@@ -541,10 +503,10 @@ const App: React.FC = () => {
                       key={opt.id}
                       disabled={gameState.status === GameStatus.REVEALING || alreadyAnswered}
                       onClick={() => handleGuess(opt.id)}
-                      className={`p-5 rounded-2xl font-black text-sm uppercase transition-all transform active:scale-95 border-2 text-left group ${
+                      className={`p-5 rounded-2xl font-black text-sm uppercase border-2 text-left transition-all transform active:scale-95 ${
                         gameState.status === GameStatus.REVEALING
                           ? opt.id === gameState.currentSong?.id 
-                            ? 'bg-green-500/20 border-green-500 text-green-500 shadow-lg scale-105 z-10' 
+                            ? 'bg-green-500/20 border-green-500 text-green-500 scale-105 z-10' 
                             : 'bg-zinc-950 border-transparent text-zinc-700'
                           : alreadyAnswered
                             ? 'bg-zinc-950 border-zinc-900 text-zinc-700 cursor-not-allowed'
@@ -552,7 +514,7 @@ const App: React.FC = () => {
                       }`}
                     >
                       <div className="truncate mb-0.5">{opt.title}</div>
-                      <div className={`text-[9px] font-bold opacity-40 uppercase tracking-widest ${gameState.status === GameStatus.REVEALING && opt.id === gameState.currentSong?.id ? 'opacity-100 text-green-400' : ''}`}>{opt.artist}</div>
+                      <div className="text-[9px] font-bold opacity-40 uppercase tracking-widest">{opt.artist}</div>
                     </button>
                   );
                 })}
@@ -574,27 +536,27 @@ const App: React.FC = () => {
       {gameState.status === GameStatus.FINISHED && (
         <div className="bg-zinc-900 rounded-[3rem] p-8 md:p-12 border border-zinc-800 text-center shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
            <div className="absolute top-0 left-0 w-full h-2 bg-yellow-400 shadow-glow"></div>
-           <h2 className="text-5xl md:text-7xl font-black mb-8 uppercase italic tracking-tighter neon-text">EL FINAL</h2>
+           <h2 className="text-5xl md:text-7xl font-black mb-8 uppercase italic tracking-tighter neon-text font-bungee">RESULTADOS</h2>
            <div className="space-y-3 mb-12">
               {[...gameState.players].sort((a,b) => b.score - a.score).map((p, idx) => (
                 <div key={p.id} className={`flex justify-between items-center p-6 rounded-3xl transition-all ${idx === 0 ? 'bg-yellow-400 text-black shadow-glow scale-105' : 'bg-zinc-800 text-white'}`}>
                    <div className="flex items-center gap-5">
-                      <span className={`font-black text-3xl ${idx === 0 ? 'text-black' : 'text-yellow-400'}`}>#{idx+1}</span>
+                      <span className="font-black text-3xl">#{idx+1}</span>
                       <div className="text-left">
                          <div className="font-black uppercase text-xl leading-none">{p.name}</div>
-                         <div className={`text-[10px] font-bold uppercase tracking-widest ${idx === 0 ? 'text-black/50' : 'text-zinc-500'}`}>{idx === 0 ? 'LA LEYENDA' : 'EN EL BLOQUE'}</div>
+                         <div className={`text-[10px] font-bold uppercase tracking-widest opacity-60`}>{idx === 0 ? 'EL REY' : 'BLOCK'}</div>
                       </div>
                    </div>
                    <div className="text-right">
                       <span className="font-black text-2xl">{p.score}</span>
-                      <span className={`block text-[10px] font-black uppercase tracking-tighter ${idx === 0 ? 'text-black/50' : 'text-zinc-500'}`}>PUNTOS</span>
+                      <span className="block text-[10px] font-black uppercase tracking-tighter opacity-60">PTS</span>
                    </div>
                 </div>
               ))}
            </div>
            
            <div className="h-40 w-full mb-8 bg-black/40 rounded-3xl p-4 border border-zinc-800">
-             <p className="text-zinc-600 font-black text-[10px] uppercase tracking-widest text-left mb-4">Progreso de la sesión</p>
+             <p className="text-zinc-600 font-black text-[10px] uppercase tracking-widest text-left mb-4">Métricas de sesión</p>
              <ResponsiveContainer width="100%" height="70%">
                <BarChart data={gameState.history.map((h, i) => ({ id: i, val: h.isCorrect ? 1 : 0.2 }))}>
                  <Bar dataKey="val" radius={[4, 4, 0, 0]}>
@@ -606,10 +568,7 @@ const App: React.FC = () => {
              </ResponsiveContainer>
            </div>
 
-           <button 
-             onClick={handleReset} 
-             className="w-full bg-white text-black py-6 rounded-3xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-2xl transform active:scale-95 text-xl relative z-20 cursor-pointer"
-           >
+           <button onClick={handleReset} className="w-full bg-white text-black py-6 rounded-3xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-2xl transform active:scale-95 text-xl relative z-20 cursor-pointer">
               Volver al Inicio
            </button>
         </div>
