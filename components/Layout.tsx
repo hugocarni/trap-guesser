@@ -20,7 +20,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       <main className="w-full max-w-2xl">
         {children}
       </main>
-      <footer className="mt-8 pt-6 pb-4 text-zinc-600 text-[10px] text-center uppercase tracking-widest opacity-50">
+      <footer className="mt-8 pt-6 pb-4 text-white text-[10px] text-center uppercase tracking-widest opacity-80">
         &copy; 2026 Trap Guessr • by @hugocarni
       </footer>
     </div>

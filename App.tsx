@@ -38,16 +38,29 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const init = async () => {
-      const data = await fetchTopTrapReggaeton();
-      setSongs(data);
-      setLoading(false);
+      setLoading(true);
+      try {
+        const data = await fetchTopTrapReggaeton();
+        if (data && data.length > 0) {
+          setSongs(data);
+        } else {
+          console.warn("No songs found in first attempt. Retrying...");
+          // Simple retry logic
+          const retryData = await fetchTopTrapReggaeton();
+          if (retryData) setSongs(retryData);
+        }
+      } catch (e) {
+        console.error("Failed to fetch songs", e);
+      } finally {
+        setLoading(false);
+      }
     };
     init();
   }, []);
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = volume;
-  }, [volume]);
+  }, [volume, audioRef]);
 
   const broadcast = (data: any) => {
     connectionsRef.current.forEach(conn => {
@@ -66,7 +79,7 @@ const App: React.FC = () => {
   }, []);
 
   const playSnippet = useCallback((songToPlay: Song, duration: number) => {
-    if (!audioRef.current || !songToPlay) return;
+    if (!audioRef.current || !songToPlay || !songToPlay.previewUrl) return;
     
     stopAudio();
     audioRef.current.src = songToPlay.previewUrl;
@@ -77,7 +90,6 @@ const App: React.FC = () => {
       playPromise
         .then(() => {
           setIsPlaying(true);
-          // Precise start time for calculating individual response speed
           setStartTime(Date.now());
           
           if (timerRef.current) clearTimeout(timerRef.current);
@@ -86,7 +98,10 @@ const App: React.FC = () => {
             setIsPlaying(false);
           }, duration * 1000);
         })
-        .catch(e => console.error("Playback error:", e));
+        .catch(e => {
+          console.error("Playback error:", e);
+          setIsPlaying(false);
+        });
     }
   }, [volume, stopAudio]);
 
@@ -100,8 +115,9 @@ const App: React.FC = () => {
         status: GameStatus.PLAYING 
       }));
     } else if (data.type === 'PLAY_AUDIO') {
-      // Clients receive song and duration from host to sync playback
-      setTimeout(() => playSnippet(data.song, data.duration), 50);
+      if (data.song) {
+        setTimeout(() => playSnippet(data.song, data.duration), 50);
+      }
     } else if (data.type === 'REVEAL') {
       setGameState(prev => ({ ...prev, status: GameStatus.REVEALING, players: data.players }));
       stopAudio();
@@ -126,15 +142,31 @@ const App: React.FC = () => {
              stopAudio();
           }, 800);
         } else {
-          broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: updatedPlayers } });
+          const hiddenScoresPlayers = updatedPlayers.map(p => ({
+            ...p,
+            score: prev.players.find(old => old.id === p.id)?.score || 0
+          }));
+          broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: hiddenScoresPlayers } });
         }
         return { ...prev, players: updatedPlayers };
       });
+    } else if (data.type === 'RESET_TO_LOBBY') {
+        setGameState(prev => ({
+            ...prev,
+            status: GameStatus.LOBBY,
+            score: 0,
+            currentRound: 0,
+            history: [],
+            players: prev.players.map(p => ({ ...p, score: 0, hasAnswered: false }))
+        }));
     }
   }, [playSnippet, stopAudio]);
 
   const createRoom = () => {
-    if (!gameState.playerName) return;
+    if (!gameState.playerName) {
+        alert("Introduce un nombre para jugar online");
+        return;
+    }
     const code = Math.random().toString(36).substring(2, 6).toUpperCase();
     const peer = new Peer(`TRAPGUESSR-${code}`);
     
@@ -171,7 +203,11 @@ const App: React.FC = () => {
   };
 
   const joinRoom = () => {
-    if (!gameState.playerName || !roomInput) return;
+    if (!gameState.playerName) {
+        alert("Introduce un nombre para jugar online");
+        return;
+    }
+    if (!roomInput) return;
     const peer = new Peer();
     peerRef.current = peer;
 
@@ -192,6 +228,11 @@ const App: React.FC = () => {
   };
 
   const startNewRound = useCallback((isChallenge: boolean = false) => {
+    if (songs.length === 0) {
+      alert("Todavía no se han cargado las canciones. Espera un segundo o revisa tu conexión.");
+      return;
+    }
+    
     stopAudio();
     
     setGameState(prev => {
@@ -204,11 +245,21 @@ const App: React.FC = () => {
       }
 
       const usedIds = prev.history.map(h => h.song.id);
-      const availablePool = songs.filter(s => !usedIds.includes(s.id));
-      const currentSong = availablePool[Math.floor(Math.random() * availablePool.length)];
-      const otherOptions = songs.filter(s => s.id !== currentSong.id).sort(() => Math.random() - 0.5).slice(0, 3);
-      const options = [currentSong, ...otherOptions].sort(() => Math.random() - 0.5);
+      let availablePool = songs.filter(s => !usedIds.includes(s.id));
+      if (availablePool.length === 0) availablePool = songs;
 
+      const currentSong = availablePool[Math.floor(Math.random() * availablePool.length)];
+      if (!currentSong) {
+        alert("Error al seleccionar canción.");
+        return prev;
+      }
+
+      const otherOptions = songs
+        .filter(s => s.id !== currentSong.id)
+        .sort(() => Math.random() - 0.5)
+        .slice(0, 3);
+      
+      const options = [currentSong, ...otherOptions].sort(() => Math.random() - 0.5);
       const nextDifficulty = isChallenge ? Math.max(1, 11 - nextRound) : prev.difficultySeconds;
       
       const nextRoundData = {
@@ -225,7 +276,7 @@ const App: React.FC = () => {
         broadcast({ type: 'START_ROUND', payload: nextRoundData });
         setTimeout(() => {
           broadcast({ type: 'PLAY_AUDIO', song: currentSong, duration: nextDifficulty });
-          playSnippet(currentSong, nextDifficulty); // Host plays locally
+          playSnippet(currentSong, nextDifficulty);
         }, 800);
       } else {
         setTimeout(() => playSnippet(currentSong, nextDifficulty), 100);
@@ -236,28 +287,23 @@ const App: React.FC = () => {
   }, [songs, stopAudio, playSnippet]);
 
   const handleGuess = (songId: string) => {
-    if (gameState.status !== GameStatus.PLAYING) return;
+    if (gameState.status !== GameStatus.PLAYING || !gameState.currentSong) return;
     const now = Date.now();
-    const isCorrect = songId === gameState.currentSong?.id;
+    const isCorrect = songId === gameState.currentSong.id;
     
     let points = 0;
     if (isCorrect && startTime) {
       const timeElapsed = (now - startTime) / 1000;
       const timeLeft = Math.max(0, gameState.difficultySeconds - timeElapsed);
-      // Individual bonus based on local response speed
       const speedMultiplier = (timeLeft / gameState.difficultySeconds);
       const basePoints = 50;
       const timeBonus = Math.round(speedMultiplier * 50);
       points = basePoints + timeBonus;
-      
-      if (gameState.isChallengeMode) {
-        const challengeMultiplier = 1 + (gameState.currentRound - 1) * 0.1;
-        points = Math.round(points * challengeMultiplier);
-      }
     }
 
     if (gameState.isMultiplayer) {
-      const myId = peerRef.current.id;
+      const myId = peerRef.current?.id;
+      if (!myId) return;
       broadcast({ type: 'GUESS_SUBMITTED', playerId: myId, isCorrect, points });
       setGameState(prev => ({
         ...prev,
@@ -277,13 +323,38 @@ const App: React.FC = () => {
   };
 
   const startPractice = () => {
-    if (!gameState.playerName) return;
-    const soloPlayer: Player = { id: 'local-player', name: gameState.playerName, score: 0, isHost: true };
-    setGameState(prev => ({ ...prev, status: GameStatus.START, isMultiplayer: false, players: [soloPlayer] }));
+    const name = gameState.playerName || "Jugador 1";
+    const soloPlayer: Player = { id: 'local-player', name, score: 0, isHost: true };
+    setGameState(prev => ({ 
+        ...prev, 
+        playerName: name,
+        status: GameStatus.START, 
+        isMultiplayer: false, 
+        players: [soloPlayer],
+        isChallengeMode: false
+    }));
+  };
+
+  const handleReturnToLobby = () => {
+      broadcast({ type: 'RESET_TO_LOBBY' });
+      setGameState(prev => ({
+          ...prev,
+          status: GameStatus.LOBBY,
+          score: 0,
+          currentRound: 0,
+          history: [],
+          players: prev.players.map(p => ({ ...p, score: 0, hasAnswered: false }))
+      }));
   };
 
   const handleReset = () => {
-    window.location.href = window.location.href; // Strong reload
+    window.location.reload();
+  };
+
+  const replaySnippet = () => {
+    if (gameState.currentSong) {
+      playSnippet(gameState.currentSong, gameState.difficultySeconds);
+    }
   };
 
   if (loading) {
@@ -291,7 +362,7 @@ const App: React.FC = () => {
       <Layout>
         <div className="flex flex-col items-center justify-center h-64">
           <div className="w-16 h-16 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mb-4 shadow-glow"></div>
-          <p className="text-yellow-400 font-black animate-pulse uppercase tracking-widest text-sm">Entrando al bloque...</p>
+          <p className="text-yellow-400 font-black animate-pulse uppercase tracking-widest text-sm">Escaneando el bloque...</p>
         </div>
       </Layout>
     );
@@ -304,11 +375,11 @@ const App: React.FC = () => {
       {gameState.status === GameStatus.SETUP && (
         <div className="bg-zinc-900 p-8 rounded-3xl border border-zinc-800 text-center shadow-2xl relative overflow-hidden animate-in fade-in zoom-in-95 duration-500">
           <div className="absolute -top-24 -left-24 w-48 h-48 bg-yellow-400/5 rounded-full blur-3xl"></div>
-          <h1 className="text-4xl md:text-6xl font-black mb-6 neon-text tracking-tighter uppercase italic">Trap Guessr Online</h1>
+          <h1 className="text-4xl md:text-6xl font-black mb-6 neon-text tracking-tighter uppercase italic text-yellow-400">Trap Guessr</h1>
           <div className="space-y-4 max-w-sm mx-auto relative z-10">
             <input 
               type="text" 
-              placeholder="TU APODO" 
+              placeholder="TU APODO (OPCIONAL EN SOLO)" 
               value={gameState.playerName}
               maxLength={12}
               onChange={(e) => setGameState(p => ({ ...p, playerName: e.target.value }))}
@@ -393,7 +464,7 @@ const App: React.FC = () => {
 
       {gameState.status === GameStatus.START && (
         <div className="bg-zinc-900 p-6 md:p-10 rounded-3xl border border-zinc-800 text-center shadow-2xl relative overflow-hidden animate-in fade-in duration-500">
-          <h1 className="text-4xl md:text-5xl font-black mb-8 neon-text tracking-tighter uppercase italic">Ajustes</h1>
+          <h1 className="text-4xl md:text-5xl font-black mb-8 neon-text tracking-tighter uppercase italic text-yellow-400">Ajustes</h1>
           <div className="space-y-8">
             <div>
               <label className="block text-zinc-500 text-[10px] font-black mb-4 uppercase tracking-widest">Segundos de audio</label>
@@ -428,10 +499,25 @@ const App: React.FC = () => {
               </div>
             </div>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-12">
-            <button onClick={() => startNewRound(false)} className="bg-zinc-100 text-black py-5 rounded-2xl font-black text-lg uppercase tracking-widest hover:bg-yellow-400 transition-all">Modo Normal</button>
-            <button onClick={() => startNewRound(true)} className="bg-orange-600 text-white py-5 rounded-2xl font-black text-lg uppercase tracking-widest border-b-4 border-orange-800">Modo Desafío 🔥</button>
+          <div className={`grid grid-cols-1 ${gameState.isMultiplayer ? 'sm:grid-cols-2' : ''} gap-4 mt-12`}>
+            <button 
+              onClick={() => startNewRound(false)} 
+              className="bg-zinc-100 text-black py-5 rounded-2xl font-black text-lg uppercase tracking-widest hover:bg-yellow-400 transition-all"
+            >
+              Empezar
+            </button>
+            {gameState.isMultiplayer && (
+                <button 
+                  onClick={() => startNewRound(true)}
+                  className="bg-orange-600 text-white py-5 rounded-2xl font-black text-lg uppercase tracking-widest border-b-4 border-orange-800"
+                >
+                  Modo Desafío 🔥
+                </button>
+            )}
           </div>
+          {songs.length === 0 && (
+            <p className="mt-4 text-red-500 font-bold uppercase text-[10px] tracking-widest animate-pulse">Cargando canciones... espera un momento</p>
+          )}
         </div>
       )}
 
@@ -454,7 +540,7 @@ const App: React.FC = () => {
                     {gameState.players.map(p => (
                       <div 
                         key={p.id} 
-                        className={`w-9 h-9 rounded-full border-2 border-zinc-900 flex items-center justify-center text-xs font-black uppercase ${p.hasAnswered ? 'bg-green-500 shadow-glow' : 'bg-zinc-800 text-zinc-500'}`}
+                        className={`w-9 h-9 rounded-full border-2 border-zinc-900 flex items-center justify-center text-xs font-black uppercase transition-all ${p.hasAnswered ? 'bg-green-500 shadow-glow scale-110' : 'bg-zinc-800 text-zinc-500'}`}
                       >
                         {p.name.charAt(0)}
                       </div>
@@ -465,7 +551,7 @@ const App: React.FC = () => {
           </div>
 
           <div className="bg-zinc-900 rounded-[2.5rem] p-6 md:p-8 border border-zinc-800 shadow-2xl text-center relative overflow-hidden">
-             <div className="relative w-44 h-44 md:w-56 md:h-56 mx-auto mb-8">
+             <div className="relative w-44 h-44 md:w-56 md:h-56 mx-auto mb-4">
                 {gameState.status === GameStatus.REVEALING ? (
                   <img src={gameState.currentSong?.artworkUrl} className="w-full h-full object-cover rounded-[2rem] ring-4 ring-yellow-400/20 shadow-2xl animate-in zoom-in duration-500" alt="Artwork" />
                 ) : (
@@ -477,10 +563,20 @@ const App: React.FC = () => {
                 )}
              </div>
 
+             {!gameState.isMultiplayer && gameState.status === GameStatus.PLAYING && (
+                <button 
+                  onClick={replaySnippet}
+                  disabled={isPlaying}
+                  className={`mb-4 px-6 py-2 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all ${isPlaying ? 'bg-zinc-800 border-zinc-700 text-zinc-600 opacity-50 cursor-not-allowed' : 'bg-yellow-400 border-yellow-500 text-black hover:bg-white hover:scale-105 active:scale-95 shadow-glow'}`}
+                >
+                  {isPlaying ? 'Reproduciendo...' : 'Repetir Fragmento 🔊'}
+                </button>
+             )}
+
              {gameState.status === GameStatus.REVEALING ? (
                 <div className="mb-8 animate-in slide-in-from-top-4">
-                   <h2 className="text-3xl font-black text-white uppercase italic tracking-tighter mb-1">{gameState.currentSong?.title}</h2>
-                   <p className="text-yellow-400 font-black uppercase tracking-[0.3em] text-sm">{gameState.currentSong?.artist}</p>
+                   <h2 className="text-3xl font-black text-white uppercase italic tracking-tighter mb-1">{gameState.currentSong?.title || "???"}</h2>
+                   <p className="text-yellow-400 font-black uppercase tracking-[0.3em] text-sm">{gameState.currentSong?.artist || "???"}</p>
                 </div>
              ) : (
                 <div className="mb-8 px-4 md:px-12">
@@ -493,6 +589,7 @@ const App: React.FC = () => {
 
              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {gameState.options.map(opt => {
+                  if (!opt) return null;
                   const myPlayer = gameState.isMultiplayer 
                     ? gameState.players.find(p => p.id === (peerRef.current?.id))
                     : gameState.players[0];
@@ -513,8 +610,8 @@ const App: React.FC = () => {
                             : 'bg-zinc-800 border-zinc-700 text-white hover:border-yellow-400 hover:bg-zinc-700 shadow-md'
                       }`}
                     >
-                      <div className="truncate mb-0.5">{opt.title}</div>
-                      <div className="text-[9px] font-bold opacity-40 uppercase tracking-widest">{opt.artist}</div>
+                      <div className="truncate mb-0.5">{opt.title || "???"}</div>
+                      <div className="text-[9px] font-bold opacity-40 uppercase tracking-widest">{opt.artist || "???"}</div>
                     </button>
                   );
                 })}
@@ -568,9 +665,16 @@ const App: React.FC = () => {
              </ResponsiveContainer>
            </div>
 
-           <button onClick={handleReset} className="w-full bg-white text-black py-6 rounded-3xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-2xl transform active:scale-95 text-xl relative z-20 cursor-pointer">
-              Volver al Inicio
-           </button>
+           <div className="grid grid-cols-1 gap-4">
+               {gameState.isMultiplayer && (gameState.players.find(p => p.isHost && (p.id === peerRef.current?.id || p.id === 'local-player'))) && (
+                    <button onClick={handleReturnToLobby} className="w-full bg-yellow-400 text-black py-6 rounded-3xl font-black uppercase tracking-widest hover:bg-white transition-all shadow-2xl transform active:scale-95 text-xl">
+                        Volver a la Sala
+                    </button>
+               )}
+               <button onClick={handleReset} className="w-full bg-white text-black py-6 rounded-3xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-2xl transform active:scale-95 text-xl relative z-20 cursor-pointer">
+                  Menú Principal
+               </button>
+           </div>
         </div>
       )}
     </Layout>
