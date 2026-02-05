@@ -1,0 +1,7 @@
+{
+  "name": "Trap & Reggaeton Guessr",
+  "description": "A high-energy urban music game where you guess famous Trap and Reggaeton hits from just a few seconds of audio. Featuring a Gemini-powered DJ host.",
+  "requestFramePermissions": [
+    
+  ]
+}
