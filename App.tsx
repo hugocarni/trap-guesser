@@ -53,7 +53,9 @@ const App: React.FC = () => {
 
   // PeerJS Messaging Helpers
   const broadcast = (data: any) => {
-    connectionsRef.current.forEach(conn => conn.send(data));
+    connectionsRef.current.forEach(conn => {
+      if (conn.open) conn.send(data);
+    });
   };
 
   const stopAudio = useCallback(() => {
@@ -66,56 +68,74 @@ const App: React.FC = () => {
     setStartTime(null);
   }, []);
 
-  const playSnippet = useCallback(() => {
-    if (!audioRef.current || !gameState.currentSong) return;
+  const playSnippet = useCallback((songToPlay?: Song) => {
+    const targetSong = songToPlay || gameState.currentSong;
+    if (!audioRef.current || !targetSong) return;
     
-    audioRef.current.src = gameState.currentSong.previewUrl;
+    stopAudio();
+    audioRef.current.src = targetSong.previewUrl;
     audioRef.current.volume = volume;
-    audioRef.current.play().catch(e => console.log("Playback error:", e));
-    setIsPlaying(true);
-    setStartTime(Date.now());
-
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => {
-      audioRef.current?.pause();
-      setIsPlaying(false);
-    }, gameState.difficultySeconds * 1000);
-  }, [gameState.currentSong, gameState.difficultySeconds, volume]);
+    
+    const playPromise = audioRef.current.play();
+    if (playPromise !== undefined) {
+      playPromise
+        .then(() => {
+          setIsPlaying(true);
+          setStartTime(Date.now());
+          
+          if (timerRef.current) clearTimeout(timerRef.current);
+          timerRef.current = setTimeout(() => {
+            audioRef.current?.pause();
+            setIsPlaying(false);
+          }, gameState.difficultySeconds * 1000);
+        })
+        .catch(e => console.log("Playback blocked or interrupted:", e));
+    }
+  }, [gameState.currentSong, gameState.difficultySeconds, volume, stopAudio]);
 
   // Multiplayer Message Handler
   const handlePeerData = useCallback((data: any) => {
     if (data.type === 'GAME_STATE_UPDATE') {
       setGameState(prev => ({ ...prev, ...data.payload }));
     } else if (data.type === 'START_ROUND') {
-      setGameState(prev => ({ ...prev, ...data.payload, status: GameStatus.PLAYING }));
+      setGameState(prev => ({ 
+        ...prev, 
+        ...data.payload, 
+        status: GameStatus.PLAYING 
+      }));
     } else if (data.type === 'PLAY_AUDIO') {
-      playSnippet();
+      setTimeout(() => playSnippet(data.song), 100);
     } else if (data.type === 'REVEAL') {
       setGameState(prev => ({ ...prev, status: GameStatus.REVEALING, players: data.players }));
+      stopAudio();
     } else if (data.type === 'PLAYER_JOINED') {
       const newPlayer: Player = data.player;
-      setGameState(prev => ({
-        ...prev,
-        players: [...prev.players.filter(p => p.id !== newPlayer.id), newPlayer]
-      }));
+      setGameState(prev => {
+        const updatedPlayers = [...prev.players.filter(p => p.id !== newPlayer.id), newPlayer];
+        const updatedState = { ...prev, players: updatedPlayers };
+        broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: updatedPlayers, status: prev.status } });
+        return updatedState;
+      });
     } else if (data.type === 'GUESS_SUBMITTED') {
-      // Host handles scoring
       setGameState(prev => {
         const updatedPlayers = prev.players.map(p => 
           p.id === data.playerId ? { ...p, hasAnswered: true, lastGuessCorrect: data.isCorrect, score: p.score + data.points } : p
         );
+        
         const allAnswered = updatedPlayers.every(p => p.hasAnswered);
         if (allAnswered) {
-          // Auto reveal after small delay
           setTimeout(() => {
              broadcast({ type: 'REVEAL', players: updatedPlayers });
              setGameState(s => ({ ...s, status: GameStatus.REVEALING, players: updatedPlayers }));
-          }, 1000);
+             stopAudio();
+          }, 800);
+        } else {
+          broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: updatedPlayers } });
         }
         return { ...prev, players: updatedPlayers };
       });
     }
-  }, [playSnippet]);
+  }, [playSnippet, stopAudio]);
 
   // Create Room
   const createRoom = () => {
@@ -138,10 +158,21 @@ const App: React.FC = () => {
     peer.on('connection', (conn: any) => {
       conn.on('open', () => {
         connectionsRef.current.push(conn);
-        // Send current game state to new player
-        conn.send({ type: 'GAME_STATE_UPDATE', payload: { ...gameState, roomCode: code, isMultiplayer: true } });
+        conn.send({ type: 'GAME_STATE_UPDATE', payload: { 
+          status: GameStatus.LOBBY, 
+          roomCode: code,
+          isMultiplayer: true,
+          totalRounds: gameState.totalRounds,
+          difficultySeconds: gameState.difficultySeconds
+        }});
       });
       conn.on('data', handlePeerData);
+    });
+
+    peer.on('error', (err: any) => {
+      console.error("Peer Error:", err);
+      alert("Error al crear la sala. Quizás el código ya está en uso.");
+      window.location.reload();
     });
   };
 
@@ -159,8 +190,14 @@ const App: React.FC = () => {
           type: 'PLAYER_JOINED', 
           player: { id: peer.id, name: gameState.playerName, score: 0, isHost: false } 
         });
+        setGameState(prev => ({ ...prev, status: GameStatus.LOBBY, isMultiplayer: true, roomCode: roomInput.toUpperCase() }));
       });
       conn.on('data', handlePeerData);
+    });
+
+    peer.on('error', (err: any) => {
+       console.error("Join Error:", err);
+       alert("No se pudo conectar a la sala. Verifica el código.");
     });
   };
 
@@ -169,6 +206,7 @@ const App: React.FC = () => {
     
     setGameState(prev => {
       const nextRound = prev.currentRound + 1;
+      
       if (nextRound > prev.totalRounds) {
         const finishedState = { ...prev, status: GameStatus.FINISHED };
         if (prev.isMultiplayer) broadcast({ type: 'GAME_STATE_UPDATE', payload: finishedState });
@@ -189,14 +227,15 @@ const App: React.FC = () => {
         options,
         difficultySeconds: nextDifficulty,
         status: GameStatus.PLAYING,
-        players: prev.players.map(p => ({ ...p, hasAnswered: false }))
+        players: prev.players.map(p => ({ ...p, hasAnswered: false })),
+        isChallengeMode: isChallenge
       };
 
       if (prev.isMultiplayer) {
         broadcast({ type: 'START_ROUND', payload: nextRoundData });
-        setTimeout(() => broadcast({ type: 'PLAY_AUDIO' }), 500);
+        setTimeout(() => broadcast({ type: 'PLAY_AUDIO', song: currentSong }), 600);
       } else {
-        setTimeout(playSnippet, 100);
+        setTimeout(() => playSnippet(currentSong), 100);
       }
 
       return { ...prev, ...nextRoundData };
@@ -208,7 +247,6 @@ const App: React.FC = () => {
     const endTime = Date.now();
     const isCorrect = songId === gameState.currentSong?.id;
     
-    // Time-based scoring: faster = more points
     let points = 0;
     if (isCorrect && startTime) {
       const timeElapsed = (endTime - startTime) / 1000;
@@ -225,29 +263,46 @@ const App: React.FC = () => {
 
     if (gameState.isMultiplayer) {
       const myId = peerRef.current.id;
-      const hostConn = connectionsRef.current[0]; // In P2P simple mode, first is usually host
       broadcast({ type: 'GUESS_SUBMITTED', playerId: myId, isCorrect, points });
       setGameState(prev => ({
         ...prev,
-        players: prev.players.map(p => p.id === myId ? { ...p, hasAnswered: true, lastGuessCorrect: isCorrect, score: p.score + points } : p)
+        players: prev.players.map(p => p.id === myId ? { ...p, hasAnswered: true, lastGuessCorrect: isCorrect, score: p.score + points } : p),
+        history: [...prev.history, { song: prev.currentSong!, isCorrect }]
       }));
     } else {
       setGameState(prev => ({
         ...prev,
         status: GameStatus.REVEALING,
         score: prev.score + points,
+        players: prev.players.map(p => ({ ...p, score: p.score + points })),
         history: [...prev.history, { song: prev.currentSong!, isCorrect }]
       }));
       stopAudio();
     }
   };
 
+  const startPractice = () => {
+    if (!gameState.playerName) return;
+    const soloPlayer: Player = { id: 'local-player', name: gameState.playerName, score: 0, isHost: true };
+    setGameState(prev => ({ 
+      ...prev, 
+      status: GameStatus.START, 
+      isMultiplayer: false,
+      players: [soloPlayer] 
+    }));
+  };
+
+  const handleReset = () => {
+    // Standard reload is the most reliable way to reset PeerJS states and IDs
+    window.location.reload();
+  };
+
   if (loading) {
     return (
       <Layout>
         <div className="flex flex-col items-center justify-center h-64">
-          <div className="w-16 h-16 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mb-4"></div>
-          <p className="text-yellow-400 font-bold animate-pulse uppercase tracking-widest text-sm">Entrando al bloque...</p>
+          <div className="w-16 h-16 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mb-4 shadow-glow"></div>
+          <p className="text-yellow-400 font-black animate-pulse uppercase tracking-widest text-sm">Entrando al bloque...</p>
         </div>
       </Layout>
     );
@@ -258,34 +313,36 @@ const App: React.FC = () => {
       <audio ref={audioRef} />
 
       {gameState.status === GameStatus.SETUP && (
-        <div className="bg-zinc-900 p-8 rounded-3xl border border-zinc-800 text-center shadow-2xl relative overflow-hidden">
+        <div className="bg-zinc-900 p-8 rounded-3xl border border-zinc-800 text-center shadow-2xl relative overflow-hidden animate-in fade-in zoom-in-95 duration-500">
+          <div className="absolute -top-24 -left-24 w-48 h-48 bg-yellow-400/5 rounded-full blur-3xl"></div>
           <h1 className="text-4xl md:text-6xl font-black mb-6 neon-text tracking-tighter uppercase italic">Trap Guessr Online</h1>
-          <div className="space-y-4 max-w-sm mx-auto">
+          <div className="space-y-4 max-w-sm mx-auto relative z-10">
             <input 
               type="text" 
-              placeholder="TU APODO (Ej: Benito)" 
+              placeholder="TU APODO" 
               value={gameState.playerName}
+              maxLength={12}
               onChange={(e) => setGameState(p => ({ ...p, playerName: e.target.value }))}
-              className="w-full bg-zinc-800 border-2 border-zinc-700 p-4 rounded-xl text-white font-bold focus:border-yellow-400 outline-none transition-all uppercase tracking-widest"
+              className="w-full bg-zinc-950 border-2 border-zinc-800 p-4 rounded-xl text-white font-black focus:border-yellow-400 outline-none transition-all uppercase tracking-widest text-center"
             />
             
             <div className="grid grid-cols-1 gap-3 pt-4">
               <button 
-                onClick={() => setGameState(p => ({ ...p, status: GameStatus.START }))}
-                className="bg-yellow-400 text-black py-4 rounded-xl font-black uppercase tracking-widest hover:bg-white transition-all shadow-glow"
+                onClick={startPractice}
+                className="bg-yellow-400 text-black py-4 rounded-xl font-black uppercase tracking-widest hover:bg-white transition-all shadow-glow transform active:scale-95"
               >
-                Solo (Modo Práctica)
+                Solo (Práctica)
               </button>
               
               <div className="relative flex py-5 items-center">
                   <div className="flex-grow border-t border-zinc-800"></div>
-                  <span className="flex-shrink mx-4 text-zinc-600 font-bold text-xs uppercase">Online</span>
+                  <span className="flex-shrink mx-4 text-zinc-600 font-bold text-[10px] uppercase tracking-[0.2em]">Competitivo</span>
                   <div className="flex-grow border-t border-zinc-800"></div>
               </div>
 
               <button 
                 onClick={createRoom}
-                className="bg-zinc-100 text-black py-4 rounded-xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all"
+                className="bg-zinc-100 text-black py-4 rounded-xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all transform active:scale-95"
               >
                 Crear Sala
               </button>
@@ -296,11 +353,11 @@ const App: React.FC = () => {
                   placeholder="CÓDIGO" 
                   value={roomInput}
                   onChange={(e) => setRoomInput(e.target.value.toUpperCase())}
-                  className="flex-1 bg-zinc-800 border-2 border-zinc-700 p-4 rounded-xl text-white font-bold focus:border-yellow-400 outline-none uppercase"
+                  className="flex-1 bg-zinc-950 border-2 border-zinc-800 p-4 rounded-xl text-white font-black focus:border-yellow-400 outline-none uppercase text-center"
                 />
                 <button 
                   onClick={joinRoom}
-                  className="bg-zinc-800 border-2 border-zinc-700 text-white px-6 rounded-xl font-black uppercase tracking-widest hover:bg-zinc-700 transition-all"
+                  className="bg-zinc-800 border-2 border-zinc-700 text-white px-6 rounded-xl font-black uppercase tracking-widest hover:bg-zinc-700 transition-all transform active:scale-95"
                 >
                   Entrar
                 </button>
@@ -311,48 +368,57 @@ const App: React.FC = () => {
       )}
 
       {gameState.status === GameStatus.LOBBY && (
-        <div className="bg-zinc-900 p-8 rounded-3xl border border-zinc-800 text-center shadow-2xl">
+        <div className="bg-zinc-900 p-8 rounded-3xl border border-zinc-800 text-center shadow-2xl animate-in slide-in-from-bottom-4">
           <div className="mb-6">
-             <p className="text-zinc-500 font-black uppercase text-xs tracking-widest mb-2">Sala de Espera</p>
-             <h2 className="text-5xl font-black text-yellow-400 tracking-tighter">{gameState.roomCode}</h2>
+             <p className="text-zinc-500 font-black uppercase text-[10px] tracking-widest mb-2">Código de la Sala</p>
+             <h2 className="text-6xl font-black text-yellow-400 tracking-tighter neon-text">{gameState.roomCode}</h2>
           </div>
           
-          <div className="bg-black/30 rounded-2xl p-4 mb-8 text-left space-y-2 max-h-48 overflow-y-auto">
+          <div className="bg-black/30 rounded-2xl p-6 mb-8 text-left space-y-3 max-h-64 overflow-y-auto border border-zinc-800/50">
+            <p className="text-zinc-600 font-black text-[10px] uppercase tracking-widest border-b border-zinc-800 pb-2">Jugadores en espera ({gameState.players.length})</p>
+            {gameState.players.length === 0 && (
+              <p className="text-zinc-500 font-bold uppercase tracking-widest text-xs py-4 text-center">Conectando...</p>
+            )}
             {gameState.players.map(p => (
-              <div key={p.id} className="flex justify-between items-center border-b border-zinc-800/50 pb-2">
-                <span className="font-bold text-white uppercase tracking-tight">{p.name} {p.isHost && '👑'}</span>
-                <span className="bg-green-500/10 text-green-500 text-[10px] px-2 py-0.5 rounded uppercase font-black">Ready</span>
+              <div key={p.id} className="flex justify-between items-center group">
+                <span className="font-black text-white uppercase tracking-tight text-sm flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${p.isHost ? 'bg-yellow-400' : 'bg-green-500'} animate-pulse`}></div>
+                  {p.name} {p.isHost && '👑'}
+                </span>
+                <span className="text-zinc-500 text-[10px] uppercase font-black">Conectado</span>
               </div>
             ))}
           </div>
 
-          {gameState.players[0]?.id === peerRef.current?.id ? (
+          {(gameState.players.length > 0 && gameState.players[0]?.isHost && (gameState.players[0].id === peerRef.current?.id || gameState.players[0].id === 'local-player')) ? (
             <button 
               onClick={() => setGameState(p => ({ ...p, status: GameStatus.START }))}
-              className="w-full bg-yellow-400 text-black py-4 rounded-xl font-black uppercase tracking-widest"
+              className="w-full bg-yellow-400 text-black py-5 rounded-2xl font-black uppercase tracking-widest hover:bg-white transition-all shadow-glow transform active:scale-95"
             >
-              Ir a Configuración
+              Configurar Partida
             </button>
           ) : (
-            <p className="text-zinc-500 font-bold animate-pulse uppercase tracking-widest text-sm">Esperando al host...</p>
+            <div className="py-4 px-6 bg-zinc-800/50 rounded-xl border border-zinc-700">
+               <p className="text-zinc-400 font-black animate-pulse uppercase tracking-[0.2em] text-xs">Esperando al host...</p>
+            </div>
           )}
         </div>
       )}
 
       {gameState.status === GameStatus.START && (
-        <div className="bg-zinc-900 p-6 md:p-10 rounded-3xl border border-zinc-800 text-center shadow-2xl relative overflow-hidden group">
-          <h1 className="text-4xl md:text-6xl font-black mb-4 md:mb-6 neon-text tracking-tighter uppercase italic">Configurar Partida</h1>
+        <div className="bg-zinc-900 p-6 md:p-10 rounded-3xl border border-zinc-800 text-center shadow-2xl relative overflow-hidden animate-in fade-in duration-500">
+          <h1 className="text-4xl md:text-5xl font-black mb-8 neon-text tracking-tighter uppercase italic">Ajustes del Juego</h1>
           
-          <div className="space-y-6 md:space-y-8 relative z-10">
+          <div className="space-y-8 relative z-10">
             <div>
-              <label className="block text-zinc-500 text-[10px] md:text-sm font-bold mb-3 uppercase tracking-tighter">Dificultad base</label>
+              <label className="block text-zinc-500 text-[10px] md:text-xs font-black mb-4 uppercase tracking-widest">Segundos de audio</label>
               <div className="flex justify-center gap-2 md:gap-4">
                 {[1, 3, 5, 10].map(s => (
                   <button
                     key={s}
                     onClick={() => setGameState(prev => ({ ...prev, difficultySeconds: s }))}
-                    className={`w-12 h-12 md:w-16 md:h-16 rounded-xl font-black text-lg md:text-xl transition-all ${
-                      gameState.difficultySeconds === s ? 'bg-yellow-400 text-black scale-110 shadow-glow' : 'bg-zinc-800 text-zinc-400'
+                    className={`w-14 h-14 md:w-20 md:h-20 rounded-2xl font-black text-xl md:text-2xl transition-all border-2 ${
+                      gameState.difficultySeconds === s ? 'bg-yellow-400 text-black border-yellow-400 scale-110 shadow-glow' : 'bg-zinc-800 text-zinc-500 border-zinc-700'
                     }`}
                   >
                     {s}s
@@ -362,14 +428,14 @@ const App: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-zinc-500 text-[10px] md:text-sm font-bold mb-3 uppercase tracking-tighter">Número de Canciones</label>
+              <label className="block text-zinc-500 text-[10px] md:text-xs font-black mb-4 uppercase tracking-widest">Número de Rondas</label>
               <div className="flex justify-center gap-2 md:gap-4">
                 {[5, 10, 20, 50].map(r => (
                   <button
                     key={r}
                     onClick={() => setGameState(prev => ({ ...prev, totalRounds: r }))}
-                    className={`w-12 h-12 md:w-16 md:h-16 rounded-xl font-black text-lg md:text-xl transition-all ${
-                      gameState.totalRounds === r ? 'bg-yellow-400 text-black scale-110' : 'bg-zinc-800 text-zinc-400'
+                    className={`w-14 h-14 md:w-20 md:h-20 rounded-2xl font-black text-xl md:text-2xl transition-all border-2 ${
+                      gameState.totalRounds === r ? 'bg-yellow-400 text-black border-yellow-400 scale-110 shadow-glow' : 'bg-zinc-800 text-zinc-500 border-zinc-700'
                     }`}
                   >
                     {r}
@@ -379,16 +445,16 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-8">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-12">
             <button
               onClick={() => startNewRound(false)}
-              className="bg-white text-black py-4 rounded-2xl font-black text-lg uppercase tracking-widest"
+              className="bg-zinc-100 text-black py-5 rounded-2xl font-black text-lg md:text-xl uppercase tracking-widest hover:bg-yellow-400 transition-all transform active:scale-95 shadow-xl"
             >
               Modo Normal
             </button>
             <button
               onClick={() => startNewRound(true)}
-              className="bg-orange-600 text-white py-4 rounded-2xl font-black text-lg uppercase tracking-widest"
+              className="bg-orange-600 text-white py-5 rounded-2xl font-black text-lg md:text-xl uppercase tracking-widest hover:bg-orange-500 transition-all transform active:scale-95 border-b-4 border-orange-800"
             >
               Modo Desafío 🔥
             </button>
@@ -397,19 +463,27 @@ const App: React.FC = () => {
       )}
 
       {(gameState.status === GameStatus.PLAYING || gameState.status === GameStatus.REVEALING) && (
-        <div className="space-y-4 animate-in fade-in">
-          {/* Header Info */}
-          <div className="flex justify-between items-center bg-zinc-900/50 p-4 rounded-2xl border border-zinc-800">
-            <div>
-              <div className="text-zinc-500 font-black uppercase text-[10px] tracking-widest">Ronda {gameState.currentRound}/{gameState.totalRounds}</div>
-              <div className="text-white font-black text-lg">SCORE: {gameState.isMultiplayer ? gameState.players.find(p => p.id === peerRef.current?.id)?.score : gameState.score}</div>
+        <div className="space-y-4 animate-in fade-in duration-500">
+          <div className="flex justify-between items-center bg-zinc-900/80 p-5 rounded-3xl border border-zinc-800 backdrop-blur-md shadow-xl">
+            <div className="space-y-1">
+              <div className="text-zinc-500 font-black uppercase text-[10px] tracking-widest">Ronda {gameState.currentRound} de {gameState.totalRounds}</div>
+              <div className="text-white font-black text-xl flex items-center gap-2">
+                <span className="text-yellow-400 text-sm">SCORE</span>
+                {gameState.isMultiplayer 
+                  ? (gameState.players.find(p => p.id === peerRef.current?.id)?.score || 0)
+                  : (gameState.players[0]?.score || 0)}
+              </div>
             </div>
             {gameState.isMultiplayer && (
                <div className="text-right">
-                  <div className="text-zinc-500 font-black uppercase text-[10px] tracking-widest">Sala: {gameState.roomCode}</div>
-                  <div className="flex -space-x-2 justify-end mt-1">
+                  <div className="text-zinc-500 font-black uppercase text-[10px] tracking-widest mb-2">Sala: {gameState.roomCode}</div>
+                  <div className="flex -space-x-2 justify-end">
                     {gameState.players.map(p => (
-                      <div key={p.id} className={`w-8 h-8 rounded-full border-2 border-zinc-900 flex items-center justify-center text-[10px] font-black uppercase ${p.hasAnswered ? 'bg-green-500' : 'bg-zinc-700'}`}>
+                      <div 
+                        key={p.id} 
+                        title={p.name}
+                        className={`w-9 h-9 rounded-full border-2 border-zinc-900 flex items-center justify-center text-xs font-black uppercase transition-colors ${p.hasAnswered ? 'bg-green-500 shadow-glow' : 'bg-zinc-800 text-zinc-500'}`}
+                      >
                         {p.name.charAt(0)}
                       </div>
                     ))}
@@ -418,55 +492,69 @@ const App: React.FC = () => {
             )}
           </div>
 
-          <div className="bg-zinc-900 rounded-3xl p-6 border border-zinc-800 shadow-2xl text-center">
-             <div className="relative w-40 h-40 mx-auto mb-6">
+          <div className="bg-zinc-900 rounded-[2.5rem] p-6 md:p-8 border border-zinc-800 shadow-2xl text-center relative overflow-hidden">
+             <div className="relative w-44 h-44 md:w-56 md:h-56 mx-auto mb-8">
                 {gameState.status === GameStatus.REVEALING ? (
-                  <img src={gameState.currentSong?.artworkUrl} className="w-full h-full object-cover rounded-2xl ring-4 ring-yellow-400/20 shadow-2xl" alt="Song" />
+                  <img src={gameState.currentSong?.artworkUrl} className="w-full h-full object-cover rounded-[2rem] ring-4 ring-yellow-400/20 shadow-2xl animate-in zoom-in duration-500" alt="Song" />
                 ) : (
-                  <div className={`w-full h-full bg-zinc-800 rounded-2xl flex items-center justify-center border-2 border-zinc-700`}>
-                     <div className={`w-24 h-24 rounded-full border-4 border-zinc-900 bg-zinc-700 flex items-center justify-center ${isPlaying ? 'animate-spin-slow' : ''}`}>
-                        <div className="w-8 h-8 rounded-full bg-yellow-400"></div>
+                  <div className={`w-full h-full bg-zinc-950 rounded-[2rem] flex items-center justify-center border-2 border-zinc-800 relative overflow-hidden`}>
+                     <div className={`w-28 h-28 md:w-36 md:h-36 rounded-full border-[10px] border-zinc-900 bg-zinc-800 flex items-center justify-center ${isPlaying ? 'animate-spin-slow' : ''}`}>
+                        <div className={`w-10 h-10 md:w-14 md:h-14 rounded-full bg-yellow-400 shadow-glow ${isPlaying ? 'scale-110' : 'scale-100'} transition-transform`}></div>
                      </div>
                   </div>
                 )}
              </div>
 
              {gameState.status === GameStatus.REVEALING ? (
-                <div className="mb-6">
-                   <h2 className="text-2xl font-black text-white uppercase italic">{gameState.currentSong?.title}</h2>
-                   <p className="text-yellow-400 font-bold uppercase tracking-widest">{gameState.currentSong?.artist}</p>
+                <div className="mb-8 animate-in slide-in-from-top-4">
+                   <h2 className="text-3xl font-black text-white uppercase italic tracking-tighter mb-1">{gameState.currentSong?.title}</h2>
+                   <p className="text-yellow-400 font-black uppercase tracking-[0.3em] text-sm">{gameState.currentSong?.artist}</p>
                 </div>
              ) : (
-                <div className="mb-6 px-8">
-                   <div className="h-2 bg-zinc-800 w-full rounded-full overflow-hidden mb-2">
-                      <div className={`h-full bg-yellow-400 transition-all ease-linear ${isPlaying ? 'w-full' : 'w-0'}`} style={{transitionDuration: isPlaying ? `${gameState.difficultySeconds * 1000}ms` : '200ms'}}></div>
+                <div className="mb-8 px-4 md:px-12">
+                   <div className="h-3 bg-zinc-950 w-full rounded-full overflow-hidden mb-3 border border-zinc-800">
+                      <div className={`h-full bg-yellow-400 transition-all ease-linear shadow-glow ${isPlaying ? 'w-full' : 'w-0'}`} style={{transitionDuration: isPlaying ? `${gameState.difficultySeconds * 1000}ms` : '200ms'}}></div>
                    </div>
-                   <p className="text-zinc-500 text-[10px] font-black uppercase tracking-widest">{isPlaying ? '¡ESCUCHA!' : 'SE ACABÓ EL TIEMPO'}</p>
+                   <p className="text-zinc-600 text-[10px] font-black uppercase tracking-[0.4em]">{isPlaying ? '¡ESCUCHA!' : 'TIEMPO FUERA'}</p>
                 </div>
              )}
 
-             <div className="grid grid-cols-1 gap-2">
-                {gameState.options.map(opt => (
-                  <button
-                    key={opt.id}
-                    disabled={gameState.status === GameStatus.REVEALING || (gameState.isMultiplayer && gameState.players.find(p => p.id === peerRef.current?.id)?.hasAnswered)}
-                    onClick={() => handleGuess(opt.id)}
-                    className={`p-4 rounded-xl font-black text-sm uppercase transition-all transform active:scale-95 border-2 ${
-                      gameState.status === GameStatus.REVEALING
-                        ? opt.id === gameState.currentSong?.id ? 'bg-green-500/20 border-green-500 text-green-500' : 'bg-zinc-800/50 border-transparent text-zinc-600'
-                        : (gameState.isMultiplayer && gameState.players.find(p => p.id === peerRef.current?.id)?.hasAnswered)
-                          ? 'bg-zinc-800/50 border-zinc-700 text-zinc-500'
-                          : 'bg-zinc-800 border-zinc-700 text-white hover:border-yellow-400'
-                    }`}
-                  >
-                    {opt.title} <span className="text-[10px] opacity-40 block">{opt.artist}</span>
-                  </button>
-                ))}
+             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {gameState.options.map(opt => {
+                  const myPlayer = gameState.isMultiplayer 
+                    ? gameState.players.find(p => p.id === peerRef.current?.id)
+                    : gameState.players[0];
+                  const alreadyAnswered = myPlayer?.hasAnswered;
+                  
+                  return (
+                    <button
+                      key={opt.id}
+                      disabled={gameState.status === GameStatus.REVEALING || alreadyAnswered}
+                      onClick={() => handleGuess(opt.id)}
+                      className={`p-5 rounded-2xl font-black text-sm uppercase transition-all transform active:scale-95 border-2 text-left group ${
+                        gameState.status === GameStatus.REVEALING
+                          ? opt.id === gameState.currentSong?.id 
+                            ? 'bg-green-500/20 border-green-500 text-green-500 shadow-lg scale-105 z-10' 
+                            : 'bg-zinc-950 border-transparent text-zinc-700'
+                          : alreadyAnswered
+                            ? 'bg-zinc-950 border-zinc-900 text-zinc-700 cursor-not-allowed'
+                            : 'bg-zinc-800 border-zinc-700 text-white hover:border-yellow-400 hover:bg-zinc-700 shadow-md'
+                      }`}
+                    >
+                      <div className="truncate mb-0.5">{opt.title}</div>
+                      <div className={`text-[9px] font-bold opacity-40 uppercase tracking-widest ${gameState.status === GameStatus.REVEALING && opt.id === gameState.currentSong?.id ? 'opacity-100 text-green-400' : ''}`}>{opt.artist}</div>
+                    </button>
+                  );
+                })}
              </div>
 
-             {gameState.status === GameStatus.REVEALING && (gameState.players[0]?.id === peerRef.current?.id || !gameState.isMultiplayer) && (
-               <button onClick={() => startNewRound(gameState.isChallengeMode)} className="mt-6 w-full bg-yellow-400 text-black py-4 rounded-xl font-black uppercase tracking-widest">
-                 Siguiente Ronda
+             {gameState.status === GameStatus.REVEALING && (gameState.isMultiplayer ? (gameState.players.find(p => p.id === peerRef.current?.id)?.isHost) : true) && (
+               <button 
+                 onClick={() => startNewRound(gameState.isChallengeMode)} 
+                 className="mt-10 w-full bg-white text-black py-5 rounded-2xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-2xl flex items-center justify-center gap-2 group"
+               >
+                 Siguiente Palo
+                 <svg className="w-5 h-5 group-hover:translate-x-1 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M9 5l7 7-7 7"/></svg>
                </button>
              )}
           </div>
@@ -474,21 +562,45 @@ const App: React.FC = () => {
       )}
 
       {gameState.status === GameStatus.FINISHED && (
-        <div className="bg-zinc-900 rounded-3xl p-8 border border-zinc-800 text-center shadow-2xl">
-           <h2 className="text-4xl font-black mb-6 uppercase italic">The End</h2>
-           <div className="space-y-4 mb-8">
-              {gameState.players.sort((a,b) => b.score - a.score).map((p, idx) => (
-                <div key={p.id} className="flex justify-between items-center bg-zinc-800 p-4 rounded-xl">
-                   <div className="flex items-center gap-3">
-                      <span className="text-yellow-400 font-black text-xl">#{idx+1}</span>
-                      <span className="text-white font-bold uppercase">{p.name}</span>
+        <div className="bg-zinc-900 rounded-[3rem] p-8 md:p-12 border border-zinc-800 text-center shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
+           <div className="absolute top-0 left-0 w-full h-2 bg-yellow-400 shadow-glow"></div>
+           <h2 className="text-5xl md:text-7xl font-black mb-8 uppercase italic tracking-tighter neon-text">EL FINAL</h2>
+           <div className="space-y-3 mb-12">
+              {[...gameState.players].sort((a,b) => b.score - a.score).map((p, idx) => (
+                <div key={p.id} className={`flex justify-between items-center p-6 rounded-3xl transition-all ${idx === 0 ? 'bg-yellow-400 text-black shadow-glow scale-105' : 'bg-zinc-800 text-white'}`}>
+                   <div className="flex items-center gap-5">
+                      <span className={`font-black text-3xl ${idx === 0 ? 'text-black' : 'text-yellow-400'}`}>#{idx+1}</span>
+                      <div className="text-left">
+                         <div className="font-black uppercase text-xl leading-none">{p.name}</div>
+                         <div className={`text-[10px] font-bold uppercase tracking-widest ${idx === 0 ? 'text-black/50' : 'text-zinc-500'}`}>{idx === 0 ? 'LA LEYENDA' : 'EN EL BLOQUE'}</div>
+                      </div>
                    </div>
-                   <span className="text-white font-black">{p.score} pts</span>
+                   <div className="text-right">
+                      <span className="font-black text-2xl">{p.score}</span>
+                      <span className={`block text-[10px] font-black uppercase tracking-tighter ${idx === 0 ? 'text-black/50' : 'text-zinc-500'}`}>PUNTOS</span>
+                   </div>
                 </div>
               ))}
            </div>
-           <button onClick={() => window.location.reload()} className="w-full bg-white text-black py-4 rounded-xl font-black uppercase tracking-widest">
-              Volver al inicio
+           
+           <div className="h-40 w-full mb-8 bg-black/40 rounded-3xl p-4 border border-zinc-800">
+             <p className="text-zinc-600 font-black text-[10px] uppercase tracking-widest text-left mb-4">Progreso de la sesión</p>
+             <ResponsiveContainer width="100%" height="70%">
+               <BarChart data={gameState.history.map((h, i) => ({ id: i, val: h.isCorrect ? 1 : 0.2 }))}>
+                 <Bar dataKey="val" radius={[4, 4, 0, 0]}>
+                   {gameState.history.map((entry, index) => (
+                     <Cell key={`cell-${index}`} fill={entry.isCorrect ? '#facc15' : '#3f3f46'} />
+                   ))}
+                 </Bar>
+               </BarChart>
+             </ResponsiveContainer>
+           </div>
+
+           <button 
+             onClick={handleReset} 
+             className="w-full bg-white text-black py-6 rounded-3xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-2xl transform active:scale-95 text-xl relative z-20 cursor-pointer"
+           >
+              Volver al Inicio
            </button>
         </div>
       )}
