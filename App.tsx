@@ -68,8 +68,11 @@ const App: React.FC = () => {
     setStartTime(null);
   }, []);
 
-  const playSnippet = useCallback((songToPlay?: Song) => {
+  const playSnippet = useCallback((songToPlay?: Song, durationOverride?: number) => {
     const targetSong = songToPlay || gameState.currentSong;
+    // Use override or fallback to current state. Using local variable ensures we don't wait for async state update.
+    const duration = durationOverride !== undefined ? durationOverride : gameState.difficultySeconds;
+    
     if (!audioRef.current || !targetSong) return;
     
     stopAudio();
@@ -87,7 +90,7 @@ const App: React.FC = () => {
           timerRef.current = setTimeout(() => {
             audioRef.current?.pause();
             setIsPlaying(false);
-          }, gameState.difficultySeconds * 1000);
+          }, duration * 1000);
         })
         .catch(e => console.log("Playback blocked or interrupted:", e));
     }
@@ -104,7 +107,8 @@ const App: React.FC = () => {
         status: GameStatus.PLAYING 
       }));
     } else if (data.type === 'PLAY_AUDIO') {
-      setTimeout(() => playSnippet(data.song), 100);
+      // Audio trigger from host
+      setTimeout(() => playSnippet(data.song, data.duration), 100);
     } else if (data.type === 'REVEAL') {
       setGameState(prev => ({ ...prev, status: GameStatus.REVEALING, players: data.players }));
       stopAudio();
@@ -112,9 +116,8 @@ const App: React.FC = () => {
       const newPlayer: Player = data.player;
       setGameState(prev => {
         const updatedPlayers = [...prev.players.filter(p => p.id !== newPlayer.id), newPlayer];
-        const updatedState = { ...prev, players: updatedPlayers };
         broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: updatedPlayers, status: prev.status } });
-        return updatedState;
+        return { ...prev, players: updatedPlayers };
       });
     } else if (data.type === 'GUESS_SUBMITTED') {
       setGameState(prev => {
@@ -232,10 +235,15 @@ const App: React.FC = () => {
       };
 
       if (prev.isMultiplayer) {
+        // Send updated round data to everyone
         broadcast({ type: 'START_ROUND', payload: nextRoundData });
-        setTimeout(() => broadcast({ type: 'PLAY_AUDIO', song: currentSong }), 600);
+        // After state should have updated, trigger audio for host and clients
+        setTimeout(() => {
+          broadcast({ type: 'PLAY_AUDIO', song: currentSong, duration: nextDifficulty });
+          playSnippet(currentSong, nextDifficulty); // Host plays locally too
+        }, 600);
       } else {
-        setTimeout(() => playSnippet(currentSong), 100);
+        setTimeout(() => playSnippet(currentSong, nextDifficulty), 100);
       }
 
       return { ...prev, ...nextRoundData };
@@ -263,7 +271,10 @@ const App: React.FC = () => {
 
     if (gameState.isMultiplayer) {
       const myId = peerRef.current.id;
+      // Host and Clients both broadcast their guess
       broadcast({ type: 'GUESS_SUBMITTED', playerId: myId, isCorrect, points });
+      
+      // Update local state for immediate feedback
       setGameState(prev => ({
         ...prev,
         players: prev.players.map(p => p.id === myId ? { ...p, hasAnswered: true, lastGuessCorrect: isCorrect, score: p.score + points } : p),
@@ -293,7 +304,6 @@ const App: React.FC = () => {
   };
 
   const handleReset = () => {
-    // Standard reload is the most reliable way to reset PeerJS states and IDs
     window.location.reload();
   };
 
@@ -390,7 +400,7 @@ const App: React.FC = () => {
             ))}
           </div>
 
-          {(gameState.players.length > 0 && gameState.players[0]?.isHost && (gameState.players[0].id === peerRef.current?.id || gameState.players[0].id === 'local-player')) ? (
+          {(gameState.players.length > 0 && gameState.players.find(p => p.isHost && (p.id === peerRef.current?.id || p.id === 'local-player'))) ? (
             <button 
               onClick={() => setGameState(p => ({ ...p, status: GameStatus.START }))}
               className="w-full bg-yellow-400 text-black py-5 rounded-2xl font-black uppercase tracking-widest hover:bg-white transition-all shadow-glow transform active:scale-95"
@@ -470,7 +480,7 @@ const App: React.FC = () => {
               <div className="text-white font-black text-xl flex items-center gap-2">
                 <span className="text-yellow-400 text-sm">SCORE</span>
                 {gameState.isMultiplayer 
-                  ? (gameState.players.find(p => p.id === peerRef.current?.id)?.score || 0)
+                  ? (gameState.players.find(p => p.id === (peerRef.current?.id))?.score || 0)
                   : (gameState.players[0]?.score || 0)}
               </div>
             </div>
@@ -522,7 +532,7 @@ const App: React.FC = () => {
              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {gameState.options.map(opt => {
                   const myPlayer = gameState.isMultiplayer 
-                    ? gameState.players.find(p => p.id === peerRef.current?.id)
+                    ? gameState.players.find(p => p.id === (peerRef.current?.id))
                     : gameState.players[0];
                   const alreadyAnswered = myPlayer?.hasAnswered;
                   
@@ -548,7 +558,7 @@ const App: React.FC = () => {
                 })}
              </div>
 
-             {gameState.status === GameStatus.REVEALING && (gameState.isMultiplayer ? (gameState.players.find(p => p.id === peerRef.current?.id)?.isHost) : true) && (
+             {gameState.status === GameStatus.REVEALING && (gameState.isMultiplayer ? (gameState.players.find(p => p.isHost && (p.id === peerRef.current?.id || p.id === 'local-player'))) : true) && (
                <button 
                  onClick={() => startNewRound(gameState.isChallengeMode)} 
                  className="mt-10 w-full bg-white text-black py-5 rounded-2xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-2xl flex items-center justify-center gap-2 group"
