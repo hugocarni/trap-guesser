@@ -30,36 +30,35 @@ const App: React.FC = () => {
   const [volume, setVolume] = useState(0.7);
   const [roomInput, setRoomInput] = useState('');
   const [startTime, setStartTime] = useState<number | null>(null);
+  const [fetchError, setFetchError] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const peerRef = useRef<any>(null);
   const connectionsRef = useRef<any[]>([]);
 
-  // Referencia para mantener el estado de los jugadores actualizado para el host sin depender de cierres de funciones
   const hostPlayersRef = useRef<Player[]>([]);
 
-  useEffect(() => {
-    const init = async () => {
-      setLoading(true);
-      try {
-        const data = await fetchTopTrapReggaeton();
-        if (data && data.length > 0) {
-          setSongs(data);
-        } else {
-          // If the first attempt is completely empty, try one more time
-          const retryData = await fetchTopTrapReggaeton();
-          if (retryData && retryData.length > 0) {
-            setSongs(retryData);
-          }
-        }
-      } catch (e) {
-        console.error("Failed to fetch songs", e);
-      } finally {
-        setLoading(false);
+  const loadSongs = async () => {
+    setLoading(true);
+    setFetchError(false);
+    try {
+      const data = await fetchTopTrapReggaeton();
+      if (data && data.length > 0) {
+        setSongs(data);
+      } else {
+        setFetchError(true);
       }
-    };
-    init();
+    } catch (e) {
+      console.error("Failed to fetch songs", e);
+      setFetchError(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadSongs();
   }, []);
 
   useEffect(() => {
@@ -373,7 +372,29 @@ const App: React.FC = () => {
       <Layout>
         <div className="flex flex-col items-center justify-center h-64">
           <div className="w-10 h-10 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mb-4 shadow-glow"></div>
-          <p className="text-yellow-400 font-black animate-pulse uppercase tracking-[0.2em] text-[8px] md:text-xs">Cargando palos...</p>
+          <p className="text-yellow-400 font-black animate-pulse uppercase tracking-[0.2em] text-[8px] md:text-xs text-center">
+            Escaneando el bloque...<br/>
+            <span className="text-[6px] opacity-50">iTunes API puede tardar unos segundos</span>
+          </p>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (fetchError) {
+    return (
+      <Layout>
+        <div className="bg-zinc-900 p-8 rounded-[2rem] border border-red-500/50 text-center shadow-2xl animate-in zoom-in-95 duration-500">
+          <h2 className="text-2xl font-black text-red-500 mb-4 uppercase italic">¡ERROR DE CONEXIÓN!</h2>
+          <p className="text-zinc-400 text-xs mb-6 uppercase tracking-widest leading-relaxed">
+            No se han podido cargar las canciones.<br/>Puede ser un problema temporal de iTunes o tu red.
+          </p>
+          <button 
+            onClick={loadSongs}
+            className="bg-white text-black px-8 py-3 rounded-xl font-black uppercase tracking-widest hover:bg-yellow-400 transition-all shadow-glow active:scale-95"
+          >
+            Reintentar
+          </button>
         </div>
       </Layout>
     );
@@ -436,9 +457,6 @@ const App: React.FC = () => {
                 </button>
               </div>
             </div>
-            {songs.length === 0 && (
-              <p className="text-red-500 font-bold text-[8px] uppercase animate-pulse">Error al cargar canciones. Recarga la página.</p>
-            )}
           </div>
         </div>
       )}
@@ -515,21 +533,13 @@ const App: React.FC = () => {
               </div>
             </div>
           </div>
-          <div className={`grid grid-cols-1 ${gameState.isMultiplayer ? 'sm:grid-cols-2' : ''} gap-3 md:gap-4 mt-8 md:mt-12`}>
+          <div className="grid grid-cols-1 gap-3 md:gap-4 mt-8 md:mt-12">
             <button 
               onClick={() => startNewRound(false)} 
               className="bg-zinc-100 text-black py-4 md:py-5 rounded-2xl font-black text-sm md:text-lg uppercase tracking-widest hover:bg-yellow-400 transition-all"
             >
-              Empezar
+              Empezar Partida
             </button>
-            {gameState.isMultiplayer && (
-                <button 
-                  onClick={() => startNewRound(true)}
-                  className="bg-orange-600 text-white py-4 md:py-5 rounded-2xl font-black text-sm md:text-lg uppercase tracking-widest border-b-4 border-orange-800"
-                >
-                  Modo Desafío 🔥
-                </button>
-            )}
           </div>
         </div>
       )}
