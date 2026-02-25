@@ -148,11 +148,7 @@ const App: React.FC = () => {
         setGameState(prev => ({ ...prev, status: GameStatus.REVEALING, players: updatedPlayers }));
         stopAudio();
       } else {
-        const hiddenScores = updatedPlayers.map(p => ({
-          ...p,
-          score: hostPlayersRef.current.find(h => h.id === p.id)?.score || 0
-        }));
-        broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: hiddenScores } });
+        broadcast({ type: 'GAME_STATE_UPDATE', payload: { players: updatedPlayers } });
         setGameState(prev => ({ ...prev, players: updatedPlayers }));
       }
     } else if (data.type === 'RESET_TO_LOBBY') {
@@ -557,15 +553,19 @@ const App: React.FC = () => {
               </div>
             </div>
             {gameState.isMultiplayer && (
-               <div className="text-right">
-                  <div className="text-zinc-500 font-black uppercase text-[7px] md:text-[10px] tracking-widest mb-1 md:mb-2">{gameState.roomCode}</div>
-                  <div className="flex -space-x-1 md:-space-x-2 justify-end">
-                    {gameState.players.map(p => (
-                      <div 
-                        key={p.id} 
-                        className={`w-6 h-6 md:w-9 md:h-9 rounded-full border-2 border-zinc-900 flex items-center justify-center text-[8px] md:text-xs font-black uppercase transition-all ${p.hasAnswered ? 'bg-green-500 shadow-glow scale-110' : 'bg-zinc-800 text-zinc-500'}`}
-                      >
-                        {p.name.charAt(0)}
+               <div className="text-right flex flex-col items-end">
+                  <div className="text-zinc-500 font-black uppercase text-[7px] md:text-[10px] tracking-widest mb-1">{gameState.roomCode}</div>
+                  <div className="flex flex-wrap gap-1.5 md:gap-2 justify-end max-w-[150px] md:max-w-none">
+                    {[...gameState.players].sort((a,b) => b.score - a.score).map(p => (
+                      <div key={p.id} className="flex flex-col items-center">
+                        <div 
+                          className={`w-6 h-6 md:w-9 md:h-9 rounded-full border-2 border-zinc-900 flex items-center justify-center text-[8px] md:text-xs font-black uppercase transition-all relative ${p.hasAnswered ? 'bg-green-500 shadow-glow scale-110' : 'bg-zinc-800 text-zinc-500'}`}
+                          title={p.name}
+                        >
+                          {p.name.charAt(0)}
+                          {p.isHost && <span className="absolute -top-1 -right-1 text-[6px] md:text-[8px]">👑</span>}
+                        </div>
+                        <span className="text-[6px] md:text-[9px] font-black text-yellow-400 mt-0.5 tabular-nums">{p.score}</span>
                       </div>
                     ))}
                   </div>
